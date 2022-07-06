@@ -1,12 +1,13 @@
-
-
 import os
 import sys
 import copy
+import glob
+from matplotlib.pyplot import sci
 import numpy as np
 import cv2
-from tifffile import TiffWriter, TiffFile, imwrite
+from tifffile import imwrite, imread
 import scipy.io
+import scipy.ndimage as spim
 
 def getVideosInFolder(dataFolder, avi_names = ''):
 	## dataFolder: (str) location to look for video files
@@ -35,10 +36,138 @@ def getVideosInFolder(dataFolder, avi_names = ''):
 	videoNumList = np.sort(videoNumList)
 	return videoFiles, videoNumList, numVids
 
+def GetMiniscopeDirs(topdir, animals, TiffDirsOnly=None, miniscope_tiff_name='msCam.tiff', behavcam_tiff_name='behavCam.tiff'):
+	# topdir: string under which it will loop to find animal/2022_*/sessionfolder/MiniLFOV or /BehavCam
+	# TiffDirsOnly will cause the func to return only the dirs with .tiff files (if TRUE), only the ones without .tiff (if FALSE), or all of them (if NONE)
+	# miniscope_tiff_name: tiff name for miniscope
+	# miniscope_tiff_name: tiff name for behavcam
+
+	MiniFolders  = []
+	BehavFolders = []
+	parentBehavFolders = []
+	parentMiniscopeFolders = []
+
+	for animal in animals:
+		an_dir     = str(topdir + animal)
+		year_dir   = str(topdir + animal + '/2022_*')
+		dayFolders = glob.glob(year_dir)
+		if dayFolders != None:
+			for day in dayFolders:
+				# sessRecs  = os.listdir(day)
+				folders   = list(filter(lambda x: os.path.isdir(f"{day}\\{x}"), os.listdir(day)))
+				for singleSess in folders:
+					# Miniscope camera
+					parent = str(day + '/' + singleSess + '/')
+					parent   = parent.replace("\\", "/")
+
+					miniFolder   = str(parent + 'MiniLFOV')
+					minitiffOut  = str(miniFolder + '/' + miniscope_tiff_name)
+					# Behavior camera
+					behavFolder  = str(parent + 'BehavCam')
+					behavtiffOut = str(behavFolder + '/' + behavcam_tiff_name)
+
+					exist_mini  = os.path.isfile(minitiffOut)
+					exist_behav = os.path.isfile(behavtiffOut)
+					if TiffDirsOnly is None: # take all dirs
+						MiniFolders.append(miniFolder)						
+						parentMiniscopeFolders.append(parent)	
+						BehavFolders.append(behavFolder)					
+						parentBehavFolders.append(parent)	
+					else: # take only dirs with tiff, or no tiffs
+						if exist_mini==TiffDirsOnly:
+							MiniFolders.append(miniFolder)
+							parentMiniscopeFolders.append(parent)	
+						if exist_behav==TiffDirsOnly:
+							BehavFolders.append(behavFolder)
+							parentBehavFolders.append(parent)	
+	return MiniFolders, BehavFolders, parentMiniscopeFolders, parentBehavFolders
+
+def scroll_images(image_stack, waitTime=1):
+	frameIndx = image_stack.shape[0] - 1
+	def onChange(trackbarValue):
+		img = image_stack[trackbarValue]
+		img = img.astype('uint8')
+		cv2.imshow("imageFrame", img)
+		pass
+	cv2.namedWindow('imageFrame')
+
+	cv2.createTrackbar( 'start', 'imageFrame', 0, frameIndx, onChange )
+	onChange(0)
+	cv2.waitKey()
+	cv2.getTrackbarPos('start','imageFrame')
+	cv2.destroyAllWindows()
+	# trackbarValue = 0
+	# while True:
+	# 	img = image_stack[trackbarValue]
+	# 	img = img.astype('uint8')
+	# 	cv2.imshow("imageFrame", img)
+	# 	key = cv2.waitKey(waitTime) & 0xff
+	# 	if key == ord("q"):
+	# 		cv2.destroyAllWindows()
+	# 		break
+	return
+
+def load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, temporalDownSample=1, frame_filter=None, verbose=False, show_vid=False):
+	videoFiles, videoNumList, numVids = getVideosInFolder(dataFolder, avi_names)
+	firstVideoNum = videoNumList[0]
+
+	MaxFramesPerFile = 1100 # used guess the total possible frames and preallocate memory
+
+	# Get a sample frame from the first video
+	videoFileName = videoFiles[str(firstVideoNum)]
+	cap = cv2.VideoCapture(videoFileName)
+	ret, refFrame = cap.read(0)
+	frameHeight = refFrame.shape[0]
+	frameWidth = refFrame.shape[1]
+
+	cap.release()
+	cv2.destroyAllWindows()
+
+	####################
+	if show_vid:
+		cv2.namedWindow("frame")
+	####################
+	totalFrames = MaxFramesPerFile*(numVids)#+numFramesFinal;
+	frameVect = range(0, totalFrames)
+	frameMat = np.empty([totalFrames, frameHeight, frameWidth], dtype='uint8')
+	
+	# Loop through each video
+	frameIndex = 0
+	vidCount = 0
+	for vidID in videoNumList:
+		videoFileName = videoFiles[str(vidID)]
+		if verbose: print('Starting ' + videoFileName + '... ')
+		cap = cv2.VideoCapture(videoFileName)
+		ret = True
+		fnum = 0
+		vidCount = vidCount + 1
+		while ret:
+			ret, frame = cap.read(fnum)
+			if(ret==True):
+				frame = frame[:,:,0].astype('float32')
+				if frame_filter is not None:
+					frame = spim.median_filter(frame, footprint=frame_filter).astype('uint8')
+					# frame = cv2.filter2D(frame, -1, frame_filter)
+				# frame = frame[cropROI[0][1]:cropROI[1][1],cropROI[0][0]:cropROI[1][0]]
+				frame = frame[::spatialDownSample, ::spatialDownSample] # spatial downsampling
+				if show_vid:
+					cv2.imshow('frame', frame)
+					cv2.waitKey(1)
+				frameMat[frameVect[frameIndex], :, :] = np.uint8(frame)
+				frameIndex = frameIndex + 1
+				fnum = fnum + 1
+		cap.release()
+		if verbose: print('     done - ' + str(vidCount) + ' of ' + str(numVids))
+	if show_vid:
+		cv2.destroyAllWindows()
+	# downsample the matrix
+	frameMat = frameMat[0:frameIndex:temporalDownSample, :, :] # temporal downsampling
+	return frameMat
+
 
 def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '',
-								cropROI=[], circleDef=[], spatialDownSample=1, temporalDownSample=1,
-								frame_filter=None, verbose=True):
+								cropROI=None, circleDef=[], spatialDownSample=1, temporalDownSample=1,
+								frame_filter=None, verbose=True, show_vid=False):
 	## dataFolder: (str) location to look for video files
 	## tiff_name: (str) save name for combined tiff file					
 	## avi_names: (str) common name shared by videos, should end right before video number
@@ -51,11 +180,11 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 	 # temporalDownSample = 1 # no frame downsampling	
 	## frame_filter: matrix for filtering each frame using cv2.filter2D
 	videoFiles, videoNumList, numVids = getVideosInFolder(dataFolder, avi_names)
+	# videoNumList = [videoNumList[0]]
 	firstVideoNum = videoNumList[0]
 	tiffStackout = dataFolder + '/' + tiff_name
 
-
-	MaxFramesPerFile = 1000 # used guess the total possible frames and preallocate memory
+	MaxFramesPerFile = 1100 # used guess the total possible frames and preallocate memory
 
 	# Get a sample frame from the first video
 	videoFileName = videoFiles[str(firstVideoNum)]
@@ -64,7 +193,7 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 	originalHeight = refFrame.shape[0]
 	originalWidth = refFrame.shape[1]	
 	
-	if cropROI == []:
+	if cropROI is None:
 		cropROI = [[0, 0],[refFrame.shape[1], refFrame.shape[0]]] # I know its width by height my bad was 1, 0
 
 	frameCrop = refFrame[cropROI[0][1]:cropROI[1][1], cropROI[0][0]:cropROI[1][0], 0]
@@ -75,17 +204,20 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 
 	cap.release()
 	cv2.destroyAllWindows()
-	#cv2.namedWindow("frame")
+
+	####################
+	if show_vid:
+		cv2.namedWindow("frame")
+	####################
 	totalFrames = MaxFramesPerFile*(numVids)#+numFramesFinal;
 	frameVect = range(0, totalFrames)
 	frameMat = np.empty([totalFrames, frameHeight, frameWidth], dtype='uint8')
-
+	
 	# define mask
 	if bool(circleDef):
 		center = circleDef[0]
 		radius = circleDef[1]
 		Y, X = np.ogrid[:originalHeight, :originalWidth]
-		# dist_from_center = np.sqrt((X - center[0]+cropROI[0][0])**2 + (Y-center[1]+cropROI[0][1])**2)
 		dist_from_center = np.sqrt((X - center[0])**2 + (Y-center[1])**2)
 		mask = dist_from_center > radius
 	else:
@@ -95,7 +227,7 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 	# Loop through each video
 	frameIndex = 0
 	vidCount = 0
-	for vidID in videoNumList: # range(firstVideoNum, numVids):
+	for vidID in videoNumList:
 		videoFileName = videoFiles[str(vidID)]
 		if verbose: print('Starting ' + videoFileName + '... ')
 		cap = cv2.VideoCapture(videoFileName)
@@ -105,24 +237,30 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 		while ret:
 			ret, frame = cap.read(fnum)
 			if(ret==True):
-				frame = frame[:,:,0].astype('float32')
+				frame = frame[:,:,0].astype('uint8')
 				if frame_filter is not None:
-					frame = cv2.filter2D(frame, -1, frame_filter)
+					frame = spim.median_filter(frame, footprint=frame_filter) # .astype('uint8')
+					# frame = cv2.filter2D(frame, -1, frame_filter)
 				if bool(circleDef):
 					meanF = 0 # np.mean(np.mean(frame))
 					frame[mask] = meanF
 				frame = frame[cropROI[0][1]:cropROI[1][1],cropROI[0][0]:cropROI[1][0]]
 				frame = frame[::spatialDownSample, ::spatialDownSample] # spatial downsampling
-				# cv2.imshow('frame', frame)
-				# cv2.waitKey(1)
-				frameMat[frameVect[frameIndex], :, :] = np.uint8(frame)
+				if show_vid:
+					cv2.imshow('frame', frame)
+					cv2.waitKey(1)
+				frameMat[frameVect[frameIndex], :, :] = frame
 				frameIndex = frameIndex + 1
 				fnum = fnum + 1
 		cap.release()
 		if verbose: print('     done - ' + str(vidCount) + ' of ' + str(numVids))
-	cv2.destroyAllWindows()
+	if show_vid:
+		cv2.destroyAllWindows()
 	# downsample the matrix
 	frameMat = frameMat[0:frameIndex:temporalDownSample, :, :] # temporal downsampling
+
+	# frameMat = load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, temporalDownSample=4, frame_filter=None, verbose=False, show_vid=False)
+
 	# save the parameters used
 	saveName = dataFolder + '\Crop_params.mat'
 	if frame_filter is None: frame_filter = 'None'
@@ -142,7 +280,7 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 	imwrite(tiffStackout, frameMat, bigtiff=True)
 	print('Done! Movie saved to:  ' + tiffStackout)
 
-def get_all_CropROIs(miniscopeFolders, avi_names='', shape='rect', verbose=True):
+def get_all_CropROIs(miniscopeFolders, avi_names='', shape='rect', verbose=True, load_all=False):
 	print('     ~~~ Cropping ' + str(len(miniscopeFolders)) + ' folders ~~~')
 	def draw_circ_mask(event, x, y, flags, param):
 		# grab references to the global variables
@@ -215,11 +353,27 @@ def get_all_CropROIs(miniscopeFolders, avi_names='', shape='rect', verbose=True)
 	for sessionLoop in range(0, len(miniscopeFolders)):
 		if True:
 			dataFolder = miniscopeFolders[sessionLoop]
-			videoFiles, videoNumList, numVids = getVideosInFolder(dataFolder, avi_names)
-			videoFileName = videoFiles[str(videoNumList[0])]
-			cap = cv2.VideoCapture(videoFileName)
-			ret, refFrame = cap.read(0)	
-			
+			if load_all==True:
+				tiff_name = str(dataFolder + '/behavCam.tiff')
+				if os.path.isfile(tiff_name):
+					print('Reading in existing tiff: ' + tiff_name)
+					frameMat = imread(str(dataFolder + '/behavCam.tiff'))
+				else:
+					print('Loading all avis for reference image, may take a while')
+					frameMat = load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, temporalDownSample=4, frame_filter=None, verbose=False, show_vid=False)
+				refFrame = np.max(frameMat, axis=0).astype('uint8')
+				refFrame = refFrame - np.min(refFrame)
+				refFrame = 255*(refFrame/np.max(refFrame))
+				refFrame[refFrame>255] = 255
+				refFrame = np.uint8(refFrame)
+				# b = np.min(frameMat, axis=0).astype('uint8')
+				# refFrame = a-b
+			else: # 
+				videoFiles, videoNumList, numVids = getVideosInFolder(dataFolder, avi_names)
+				videoFileName = videoFiles[str(videoNumList[0])]
+				cap = cv2.VideoCapture(videoFileName)
+				for i in range(0, 10):
+					ret, refFrame = cap.read(0) # with trigger start the 0 frame is black?	
 			clone = copy.deepcopy(refFrame)
 
 			cv2.namedWindow("refFrame")
