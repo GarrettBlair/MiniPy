@@ -1,8 +1,10 @@
+# from heapq import merge
 import os
 import sys
 import copy
 import glob
-from matplotlib.pyplot import sci
+import time
+# from matplotlib.pyplot import sci
 import numpy as np
 import cv2
 from tifffile import imwrite, imread
@@ -107,30 +109,41 @@ def scroll_images(image_stack, waitTime=1):
 	# 		break
 	return
 
-def load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, temporalDownSample=1, frame_filter=None, verbose=False, show_vid=False):
+def load_miniscope_avis(dataFolder, avi_names = '', cropROI=None, spatialDownSample=1, temporalDownSample=1, frame_filter=None, verbose=False, show_vid=False):
 	videoFiles, videoNumList, numVids = getVideosInFolder(dataFolder, avi_names)
 	firstVideoNum = videoNumList[0]
-
-	MaxFramesPerFile = 1100 # used guess the total possible frames and preallocate memory
 
 	# Get a sample frame from the first video
 	videoFileName = videoFiles[str(firstVideoNum)]
 	cap = cv2.VideoCapture(videoFileName)
 	ret, refFrame = cap.read(0)
-	frameHeight = refFrame.shape[0]
-	frameWidth = refFrame.shape[1]
-
-	cap.release()
-	cv2.destroyAllWindows()
-
+	frameWidth, frameHeight = (
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        )
+	FramesPerFile = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+	
 	####################
+	cv2.destroyAllWindows()
 	if show_vid:
 		cv2.namedWindow("frame")
 	####################
-	totalFrames = MaxFramesPerFile*(numVids)#+numFramesFinal;
+	totalFrames = FramesPerFile*(numVids)#+numFramesFinal;
 	frameVect = range(0, totalFrames)
+	if cropROI is None:
+		cropROI = []
+		cropROI[0][1] = 0
+		cropROI[1][1] = frameHeight
+		cropROI[0][0] = 0
+		cropROI[1][1] = frameWidth
+
+	refFrame = refFrame[cropROI[0][1]:cropROI[1][1],cropROI[0][0]:cropROI[1][0]]
+	refFrame = refFrame[::spatialDownSample, ::spatialDownSample]
+	frameHeight = refFrame.shape[0]
+	frameWidth = refFrame.shape[1]
 	frameMat = np.empty([totalFrames, frameHeight, frameWidth], dtype='uint8')
-	
+	cap.release()
+
 	# Loop through each video
 	frameIndex = 0
 	vidCount = 0
@@ -148,7 +161,7 @@ def load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, tempora
 				if frame_filter is not None:
 					frame = spim.median_filter(frame, footprint=frame_filter).astype('uint8')
 					# frame = cv2.filter2D(frame, -1, frame_filter)
-				# frame = frame[cropROI[0][1]:cropROI[1][1],cropROI[0][0]:cropROI[1][0]]
+				frame = frame[cropROI[0][1]:cropROI[1][1],cropROI[0][0]:cropROI[1][0]]
 				frame = frame[::spatialDownSample, ::spatialDownSample] # spatial downsampling
 				if show_vid:
 					cv2.imshow('frame', frame)
@@ -167,7 +180,7 @@ def load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, tempora
 
 def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '',
 								cropROI=None, circleDef=[], spatialDownSample=1, temporalDownSample=1,
-								frame_filter=None, verbose=True, show_vid=False):
+								frame_filter=None, verbose=True, show_vid=False, multicore=True):
 	## dataFolder: (str) location to look for video files
 	## tiff_name: (str) save name for combined tiff file					
 	## avi_names: (str) common name shared by videos, should end right before video number
@@ -182,30 +195,153 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 	videoFiles, videoNumList, numVids = getVideosInFolder(dataFolder, avi_names)
 	# videoNumList = [videoNumList[0]]
 	firstVideoNum = videoNumList[0]
-	tiffStackout = dataFolder + '/' + tiff_name
-
-	MaxFramesPerFile = 1100 # used guess the total possible frames and preallocate memory
-
-	# Get a sample frame from the first video
-	videoFileName = videoFiles[str(firstVideoNum)]
-	cap = cv2.VideoCapture(videoFileName)
-	ret, refFrame = cap.read(0)
-	originalHeight = refFrame.shape[0]
-	originalWidth = refFrame.shape[1]	
+	if os.path.isabs(tiff_name) == False:
+		tiffStackout = dataFolder + '/' + tiff_name
+	else:
+		tiffStackout = tiff_name
 	
 	if cropROI is None:
 		cropROI = [[0, 0],[refFrame.shape[1], refFrame.shape[0]]] # I know its width by height my bad was 1, 0
 
-	frameCrop = refFrame[cropROI[0][1]:cropROI[1][1], cropROI[0][0]:cropROI[1][0], 0]
-	# frameRate = int(cap.get(5))
-	frameCrop = frameCrop[::spatialDownSample, ::spatialDownSample]
-	frameHeight = frameCrop.shape[0]
-	frameWidth = frameCrop.shape[1]
+	# cap.release()
+	# cv2.destroyAllWindows()
 
-	cap.release()
-	cv2.destroyAllWindows()
-
+	start_time = time.time()
 	####################
+	if show_vid:
+		cv2.namedWindow("frame")
+	####################
+	# define mask
+	if bool(circleDef):
+		center = circleDef[0]
+		radius = circleDef[1]
+		Y, X = np.ogrid[:originalHeight, :originalWidth]
+		dist_from_center = np.sqrt((X - center[0])**2 + (Y-center[1])**2)
+		mask = dist_from_center > radius
+	else:
+		mask = []
+	if multicore == True:
+		print('     ~~~ Combining  ' + str(numVids) + ' video in ' + dataFolder + ' ~~~')
+		print('     ~~~ MULTIPROCESSING ~~~')
+		import multiprocessing as mp
+		# from process_video_multiprocessing import miniscope_avi_multiprocessing, miniscope_multiprocessing_combine
+		from miniscope_tiffs import miniscope_avi_multiprocessing, miniscope_multiprocessing_combine
+		from functools import partial
+		# def multi_process_avis():
+		# 	print("Video processing using {} processes...".format(num_processes))
+		# 	# Parallel execution across multiple videos
+		# 	p = mp.Pool(num_processes)
+		# 	# avi_nums = np.arange(totalAvis+1)
+		# 	v = np.arange(totalAvis+1)
+		# 	frameMat = p.map(partial(miniscope_avi_multiprocessing, fileDir=dataFolder), v)
+
+		# 	return frameMat
+
+		num_processes = mp.cpu_count()
+		print("Number of CPU: " + str(num_processes))
+		# frameMat_multi = multi_process_avis()
+		print("Video processing using {} processes...".format(num_processes))
+		# Parallel execution across multiple videos
+		p = mp.Pool(num_processes)
+		frameMat_multi = p.map(partial(miniscope_avi_multiprocessing, fileDir=dataFolder), np.arange(numVids+1))
+
+		frameMat = miniscope_multiprocessing_combine(frameMat_multi, videoFiles, cropROI, frame_filter, tds=temporalDownSample, sds=spatialDownSample)
+		frameIndex = frameMat.shape[0]
+	else:
+		print('     ~~~ Combining  ' + str(numVids) + ' video in ' + dataFolder + ' ~~~')
+		frameMat = load_miniscope_avis(dataFolder=dataFolder, avi_names=avi_names, cropROI=cropROI, spatialDownSample=spatialDownSample, temporalDownSample=temporalDownSample, frame_filter=frame_filter, verbose=verbose, show_vid=show_vid)
+		frameIndex = frameMat.shape[0]
+		# load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, temporalDownSample=1, frame_filter=None, verbose=False, show_vid=False)
+	end_time = time.time()
+	total_processing_time = end_time - start_time
+	print("Time taken: {}".format(total_processing_time))
+
+
+	# frameMat = load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, temporalDownSample=4, frame_filter=None, verbose=False, show_vid=False)
+
+	# save the parameters used
+	if tiff_name != 'test.tiff':
+		saveName = dataFolder + '\Crop_params.mat'
+		if frame_filter is None: frame_filter = 'None'
+		if mask is None: mask = 'None'
+
+		scipy.io.savemat(saveName, {'cropROI':cropROI, 'spatialDownSample':spatialDownSample,
+			'temporalDownSample':temporalDownSample, 'totalFrames':frameIndex, 'tiffStackout':tiffStackout,
+			'mask':mask, 'frame_filter':frame_filter})
+		print('Parameters saved to:  ' + saveName)
+	else:
+		print('TESTING - Crop params not saved')
+	
+	# alternative writing method with TiffWriter
+	# tifs = np.array([tifffile.imread(t) for t in fls])
+	# with TiffWriter(tiffStackout, bigtiff=True) as tiff:
+	# 	for i in range(0, frameMat.shape[0]):
+	# 		tiff.save(frameMat[i,:,:], compression='None')
+	# tiffStackout = dataFolder + '/alt_' + tiff_name
+	imwrite(tiffStackout, frameMat, bigtiff=True)
+	print('Done! Movie saved to:  ' + tiffStackout)
+
+def combine_multi_folders(dataFolderList, output_folder, tiff_name='msCam.tiff', avi_names = '',
+								cropROI=None, circleDef=[], spatialDownSample=1, temporalDownSample=1,
+								frame_filter=None, verbose=True, show_vid=False):
+	## dataFolder: (str) location to look for video files
+	## tiff_name: (str) save name for combined tiff file					
+	## avi_names: (str) common name shared by videos, should end right before video number
+	 # ex: folder with videos msCam1.avi, msCam2.avi; avi_names = 'msCam'
+	 # ex: folder with videos 0.avi, 1.avi; avi_names = ''	## cropROI: (int matrix) [[c1, r1], [c2, r2]] row and column (r/c) start and stop (1->2) indices to crop video							
+	## circleDef: [center, radius] of a circular mask, outside of which is set to 0							
+	## spatialDownSample: (int) number of pixels to downsample in each dimension							
+	## temporalDownSample: (int) number of frames to downsample						
+	 # spatialDownSample = 1 # no pixel downsampling
+	 # temporalDownSample = 1 # no frame downsampling	
+	## frame_filter: matrix for filtering each frame using cv2.filter2D
+	# videoFiles = {}
+	# videoNumList = []
+	# numVids = []
+	ind = 0
+	MaxFramesPerFile = 1100 # used guess the total possible frames and preallocate memory
+	timeStampFname = 'timeStamps.csv'
+	OriBNOFname = 'headOrientation.csv'
+	for dataFolder in dataFolderList:
+		print(dataFolder)
+		# dataFolder = dataFolder_sub + '/MiniLFOV/'
+		if ind == 0:
+			videoFiles, videoNumList, numVids = getVideosInFolder(dataFolder, avi_names)
+			firstVideoNum = videoNumList[0]
+			tiffStackout = output_folder + '/' + tiff_name
+
+			tsFile = output_folder  + '/' + timeStampFname
+			oriFile = output_folder + '/' + OriBNOFname 
+			# Get a sample frame from the first video
+			videoFileName = videoFiles[str(firstVideoNum)]
+			cap = cv2.VideoCapture(videoFileName)
+			ret, refFrame = cap.read(0)
+			originalHeight = refFrame.shape[0]
+			originalWidth = refFrame.shape[1]	
+			
+			if cropROI is None:
+				cropROI = [[0, 0],[refFrame.shape[1], refFrame.shape[0]]] # I know its width by height my bad was 1, 0
+
+			frameCrop = refFrame[cropROI[0][1]:cropROI[1][1], cropROI[0][0]:cropROI[1][0], 0]
+			# frameRate = int(cap.get(5))
+			frameCrop = frameCrop[::spatialDownSample, ::spatialDownSample]
+			frameHeight = frameCrop.shape[0]
+			frameWidth = frameCrop.shape[1]
+
+			cap.release()
+			cv2.destroyAllWindows()
+		else:
+			sub_videoFiles, sub_videoNumList, sub_numVids = getVideosInFolder(dataFolder, avi_names)
+			for v in sub_videoNumList:
+				newnum = ind*100 + v # str(ind) + '_' + str(v)
+				print(newnum)
+				videoNumList = np.append(videoNumList, newnum)
+				videoFiles[str(newnum)] = sub_videoFiles[str(v)]
+			numVids = numVids + sub_numVids
+		ind = ind+1
+		
+	print(videoFiles)
+	###################
 	if show_vid:
 		cv2.namedWindow("frame")
 	####################
@@ -227,6 +363,7 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 	# Loop through each video
 	frameIndex = 0
 	vidCount = 0
+	print(videoNumList)
 	for vidID in videoNumList:
 		videoFileName = videoFiles[str(vidID)]
 		if verbose: print('Starting ' + videoFileName + '... ')
@@ -262,7 +399,7 @@ def crop_and_convert_miniscope(dataFolder, tiff_name='msCam.tiff', avi_names = '
 	# frameMat = load_miniscope_avis(dataFolder, avi_names = '', spatialDownSample=1, temporalDownSample=4, frame_filter=None, verbose=False, show_vid=False)
 
 	# save the parameters used
-	saveName = dataFolder + '\Crop_params.mat'
+	saveName = output_folder + '\Crop_params.mat'
 	if frame_filter is None: frame_filter = 'None'
 	if mask is None: mask = 'None'
 
@@ -327,7 +464,13 @@ def get_all_CropROIs(miniscopeFolders, avi_names='', shape='rect', verbose=True,
 			cv2.rectangle(refInput, refPt, refNew, (0, 0, 255), 2)	
 		elif shape2=='square':
 			crop_size = (2*circRad, 2*circRad)
-			cv2.rectangle(refInput, refPt, refPt+2*circRad, (0, 0, 255), 2)	# -1*circRad
+			rr = refPt+2*circRad
+			# print(refInput.shape)
+			# print(refPt)
+			# print(refNew)
+			# print(refPt+2*circRad)
+			cv2.rectangle(refInput, refPt, (rr[0], rr[1]), (0, 0, 255), 2)	
+			# cv2.rectangle(refInput, refPt, refPt+2*circRad, (0, 0, 255), 2)	# -1*circRad
 		elif shape2=='circle':
 			crop_size = (2*circRad, 2*circRad)
 			cv2.circle(refInput, circMid, circRad, (0, 0, 255), 2)
@@ -438,3 +581,67 @@ def get_all_CropROIs(miniscopeFolders, avi_names='', shape='rect', verbose=True,
 			print(miniscopeFolders[sessionLoop])
 	cv2.destroyAllWindows()
 	return roiDict , maskDict
+
+def miniscope_avi_multiprocessing(aviNum, fileDir):
+    # based off the method described by Sabina Pokhrel at:
+    # https://towardsdatascience.com/faster-video-processing-in-python-using-parallel-computing-25da1ad4a01
+    # Read video file
+    # fname = 'C:/Users/gjb326/Desktop/RecordingData/AlejandroGrau/TestMouse1/2022_07_13/15_12_07/MiniLFOV/0.avi'
+    fname = fileDir + '/' + str(aviNum) + '.avi'
+    cap = cv2.VideoCapture(fname)
+    #     cap.set(cv2.CAP_PROP_POS_FRAMES)
+    # get height, width and frame count of the video
+    width, height = (
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        )
+    no_of_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frameMat = np.empty([no_of_frames, height, width], dtype='uint8')
+    fnum = 0
+    ret = True
+    try:
+        while ret:
+            ret, refFrame = cap.read(fnum)
+            if not ret:
+                break
+            frame = refFrame[:,:,0].astype('uint8')
+            frameMat[fnum, :, :] = frame
+            fnum = fnum + 1   
+    except:
+        # Release resources
+        cap.release()
+    frameMat = frameMat[0:fnum, :, :] 
+    # Release resources
+    cap.release()
+    return frameMat
+
+def miniscope_multiprocessing_combine(frameMat_multi, videoFiles, cropROI, frame_filter, tds=1, sds=1):
+	frames_per_file, height, width = (frameMat_multi[0].shape)
+	totalAvis = len(videoFiles)-1
+	avi_nums = np.arange(totalAvis)
+	totalFrames = frames_per_file*(totalAvis+1)
+	frameMat = np.empty([totalFrames, height, width], dtype='uint8')
+	for aviNum in avi_nums:
+		f1 = aviNum*1000
+		f2 = (aviNum+1)*1000   
+		ff = frameMat_multi.pop(0)
+		frameMat[f1:f2, :, :] = ff
+	
+	# get the last video files, that might have fewer frames than the rest
+	no_of_frames_last = frameMat_multi[0].shape[0]
+	f1 = (totalAvis)*1000
+	f2 = (totalAvis)*1000 + no_of_frames_last
+	frameMat[f1:f2, :, :] = frameMat_multi.pop(0)
+
+	# temporal downsampling
+	frameMat = frameMat[0:f2:tds]
+	# crop to ROI
+	frameMat = frameMat[:, cropROI[0][1]:cropROI[1][1],cropROI[0][0]:cropROI[1][0]]
+	if frame_filter is not None:
+		import scipy.ndimage as spim
+		for ind, frame in enumerate(frameMat):
+			frame = spim.median_filter(frame, footprint=frame_filter) # .astype('uint8')
+			frameMat[ind,:,:] = frame
+	# spatial downsampling
+	frameMat = frameMat[:, ::sds, ::sds]
+	return frameMat
